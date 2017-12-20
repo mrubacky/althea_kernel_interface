@@ -6,6 +6,7 @@ description = "Gets information from and changes settings of kernel network stac
 license = "Apache-2.0"
 
 [dependencies]
+rust-crypto = "^0.2"
 regex = "0.2"
 hwaddr = "0.1.2"
 derive-error = "0.0.4"

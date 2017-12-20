@@ -8,14 +8,20 @@ use std::str;
 extern crate hwaddr;
 extern crate regex;
 extern crate itertools;
+extern crate crypto;
 
 use itertools::join;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, TcpStream, SocketAddr, SocketAddrV6};
 use hwaddr::HwAddr;
-use std::str::FromStr;
+use std::str::{FromStr, from_utf8, Utf8Error};
 use regex::Regex;
-use std::process::{Command, Output, ExitStatus};
+use std::process::{Command, Output, ExitStatus, Stdio, ChildStdin};
 use std::os::unix::process::ExitStatusExt;
+use crypto::md5;
+use crypto::digest::Digest;
+use std::fmt::Write as FmtWrite;
+use std::io::{self, Read, Write, BufReader, BufRead};
+use std::error::Error as OError;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -23,6 +29,7 @@ pub enum Error {
     UTF8(std::string::FromUtf8Error),
     ParseInt(std::num::ParseIntError),
     AddrParse(std::net::AddrParseError),
+    StrUTF8(std::str::Utf8Error),
     #[error(msg_embedded, no_from, non_std)]
     RuntimeError(String),
 }
@@ -271,6 +278,108 @@ impl KernelInterface {
             String::from("not implemented for this platform"),
         ))
     }
+
+    fn get_tunnel_key(&mut self, neigh: &IpAddr, local_pubkey : &String) -> Result<String, Error> {
+        let sockAddr = SocketAddr::new(neigh.clone(), 11492);
+        let mut stream = TcpStream::connect(sockAddr)?;
+
+        let mut reader = BufReader::new(stream);
+        let mut buf : Vec<u8> = vec![0; 128];
+        let mut bufStr = String::new();
+        println!("reading header");
+        reader.read_line(&mut bufStr);
+        if bufStr.contains("ALTHEA") {
+            stream = reader.into_inner();
+            println!("sending request");
+            let _ = stream.write(&[1])?;
+            println!("reading response");
+            let len = stream.read(&mut buf)?;
+            buf.truncate(len);
+            println!("sending pubkey");
+            let _ = stream.write(local_pubkey.as_bytes());
+            return Ok(String::from_utf8(buf)?);
+        } else {
+            Err(Error::RuntimeError(String::from("protocol mismatch")))
+        }
+    }
+
+    pub fn get_port_and_ip_from_key(&mut self, pubkey: &String) -> SocketAddrV6 {
+        let mut ipv6addr = String::from("fd01:1234:1234:1234");
+        let mut hash = md5::Md5::new();
+        hash.input(pubkey.as_bytes());
+        let mut res : Vec<u8> = vec![0;16];
+        hash.result(&mut res);
+        for i in 0..8 {
+            if i % 2 == 0 {
+                write!(&mut ipv6addr, ":");
+            }
+            if res[i] < 16 {
+                write!(&mut ipv6addr, "0");
+            }
+            write!(&mut ipv6addr, "{:x}", res[i]);
+        }
+        let port = (( (res[0] as u16) | (res[1] as u16) << 8) % 55535) + 10000;
+        let addr = SocketAddrV6::new(Ipv6Addr::from_str(ipv6addr.as_str()).unwrap(), port, 0, 0);
+        addr        
+    }
+
+    pub fn open_tunnel(&mut self, destination: IpAddr) -> Result<(),Error> {
+        if cfg!(target_os = "linux") {
+            return self.open_tunnel_linux(destination);
+        }
+
+        Err(Error::RuntimeError(String::from("not implemented for this platform")))
+    }
+
+    pub fn open_tunnel_linux(&mut self, destination: IpAddr) -> Result<(),Error> {
+        let priv_key = String::from_utf8((self.run_command)("wg", &["genkey"])?.stdout).unwrap();
+        let pub_key_proc = Command::new("wg").args(&["pubkey"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        pub_key_proc.stdin.unwrap().write_all(priv_key.as_bytes()).unwrap();
+        let mut my_pub_key = String::new();
+        pub_key_proc.stdout.unwrap().read_to_string(&mut my_pub_key);
+        println!("getting remote key");
+        let remote_pub_key = self.get_tunnel_key(&destination, &my_pub_key)?;
+        println!("finished getting key");
+
+        println!("geting local socket from pubkey");
+        let local_sock = self.get_port_and_ip_from_key(&my_pub_key);
+        println!("getting remote socket from pubkey");
+        let remote_sock = self.get_port_and_ip_from_key(&remote_pub_key);
+
+        let links = (self.run_command)("ip", &["link"])?;
+        let links = String::from_utf8(links.stdout)?;
+        let mut intf_num = 0;
+        while ( links.contains(format!("wg{}",intf_num).as_str()) ){
+            intf_num += 1;
+        }
+        let intf = format!("wg{}", intf_num);
+        println!("adding link");
+        (self.run_command)("ip", &["link", "add", &intf, "type", "wireguard"])?;
+        println!("adding addr");
+        (self.run_command)("ip", &["addr", "add", &format!("{}", local_sock.ip()), "dev", &intf, "peer", &format!("{}",remote_sock.ip())])?;
+        println!("setting link up");
+        (self.run_command)("ip", &["link", "set", &intf, "up"])?;
+        println!("configuring wg");
+        let wg_proc = Command::new("wg").args(&[
+            "set", 
+            &intf, 
+            "listen-port", 
+            &format!("{}", local_sock.port()), 
+            "peer", 
+            &format!("{}", remote_pub_key), 
+            "endpoint", 
+            &format!("{}:{}", destination, remote_sock.port()), 
+            "allowed-ips",
+            "::/0"]).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        wg_proc.stdin.unwrap().write_all(priv_key.as_bytes())?;
+        let mut res = String::new();
+        wg_proc.stderr.unwrap().read_to_string(&mut res);
+        if !res.is_empty() {
+            panic!("{}", res);
+        }
+        println!("done");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -384,8 +493,8 @@ Bridge chain: INPUT, entries: 3, policy: ACCEPT
                     3 => {
                         assert_eq!(args, delete_rule);
                         Ok(Output {
-                            stdout: b"Sorry, rule does not exist.".to_vec(),
-                            stderr: b"".to_vec(),
+                            stdout: b"".to_vec(),
+                            stderr: b"Sorry, rule does not exist.\n".to_vec(),
                             status: ExitStatus::from_raw(0),
                         })
                     }
@@ -476,8 +585,8 @@ Bridge chain: INPUT, entries: 3, policy: ACCEPT
                     1 => {
                         assert_eq!(args, delete_rule);
                         Ok(Output {
-                            stdout: b"Sorry, rule does not exist.".to_vec(),
-                            stderr: b"".to_vec(),
+                            stdout: b"".to_vec(),
+                            stderr: b"Sorry, rule does not exist.\n".to_vec(),
                             status: ExitStatus::from_raw(0),
                         })
                     }
@@ -497,8 +606,24 @@ Bridge chain: INPUT, entries: 3, policy: ACCEPT
         };
 
         ki.start_flow_counter_linux(
-            "0:0:0:aa:0:2".parse::<HwAddr>().unwrap(),
+            "0:0:0:AA:0:2".parse::<HwAddr>().unwrap(),
             "2001::3".parse::<IpAddr>().unwrap(),
         ).unwrap();
+    }
+
+    #[test]
+    fn test_open_tunnel() {
+        let mut ki = KernelInterface::new();
+        let res = ki.open_tunnel_linux("2001::2".parse::<IpAddr>().unwrap());
+        match res {
+            Ok(m) => println!("success"),
+            Err(e) => panic!("error in open_tunnel: {}", e.cause().unwrap())
+        }
+    }
+
+    #[test]
+    fn test_get_port_and_ip_from_key() {
+        let mut ki = KernelInterface::new();
+        ki.get_port_and_ip_from_key(&String::from("CEJaNjYyx4puwMvjT67GjIGNfIeJfnEo9VsmvKXwElg="));
     }
 }
