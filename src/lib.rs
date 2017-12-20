@@ -4,6 +4,8 @@ extern crate derive_error;
 #[macro_use]
 extern crate log;
 
+extern crate tempdir;
+
 use std::str;
 extern crate hwaddr;
 extern crate regex;
@@ -22,6 +24,9 @@ use crypto::digest::Digest;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Read, Write, BufReader, BufRead};
 use std::error::Error as OError;
+use std::fs::File;
+use tempdir::TempDir;
+use std::path::PathBuf;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -294,6 +299,7 @@ impl KernelInterface {
             let _ = stream.write(&[1])?;
             println!("reading response");
             let len = stream.read(&mut buf)?;
+            println!("len is: {}", len);
             buf.truncate(len);
             println!("sending pubkey");
             let _ = stream.write(local_pubkey.as_bytes());
@@ -332,11 +338,7 @@ impl KernelInterface {
     }
 
     pub fn open_tunnel_linux(&mut self, destination: IpAddr) -> Result<(),Error> {
-        let priv_key = String::from_utf8((self.run_command)("wg", &["genkey"])?.stdout).unwrap();
-        let pub_key_proc = Command::new("wg").args(&["pubkey"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-        pub_key_proc.stdin.unwrap().write_all(priv_key.as_bytes()).unwrap();
-        let mut my_pub_key = String::new();
-        pub_key_proc.stdout.unwrap().read_to_string(&mut my_pub_key);
+        let (priv_key, my_pub_key) = self.get_keypair()?;
         println!("getting remote key");
         let remote_pub_key = self.get_tunnel_key(&destination, &my_pub_key)?;
         println!("finished getting key");
@@ -345,6 +347,36 @@ impl KernelInterface {
         let local_sock = self.get_port_and_ip_from_key(&my_pub_key);
         println!("getting remote socket from pubkey");
         let remote_sock = self.get_port_and_ip_from_key(&remote_pub_key);
+
+        self.setup_wg(&destination, &local_sock, &remote_sock, &priv_key, &remote_pub_key)?;
+
+        Ok(())
+    }
+
+    pub fn get_keypair(&mut self) -> Result<(String,String),Error> {
+        let mut priv_key = String::from_utf8((self.run_command)("wg", &["genkey"])?.stdout).unwrap();
+        priv_key.pop();
+        let pub_key_proc = Command::new("wg").args(&["pubkey"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        pub_key_proc.stdin.unwrap().write_all(priv_key.as_bytes()).unwrap();
+        let mut my_pub_key = String::new();
+        pub_key_proc.stdout.unwrap().read_to_string(&mut my_pub_key);
+        my_pub_key.pop();
+
+        Ok((priv_key,my_pub_key))
+    }
+
+    pub fn setup_wg(
+        &mut self, 
+        destination: &IpAddr, 
+        local_sock: &SocketAddrV6, 
+        remote_sock: &SocketAddrV6,
+        priv_key: &String,
+        remote_pub_key: &String) -> Result<(),Error> {
+
+        let tmp_dir = TempDir::new("test")?;
+        let file_path = tmp_dir.path().join("key");
+        let mut key_file = File::create(file_path.clone())?;
+        write!(key_file, "{}", priv_key)?;
 
         let links = (self.run_command)("ip", &["link"])?;
         let links = String::from_utf8(links.stdout)?;
@@ -356,13 +388,16 @@ impl KernelInterface {
         println!("adding link");
         (self.run_command)("ip", &["link", "add", &intf, "type", "wireguard"])?;
         println!("adding addr");
-        (self.run_command)("ip", &["addr", "add", &format!("{}", local_sock.ip()), "dev", &intf, "peer", &format!("{}",remote_sock.ip())])?;
+        (self.run_command)("ip", &["addr", "add", &format!("{}/48", local_sock.ip()), "dev", &intf])?; //, "peer", &format!("{}",remote_sock.ip())])?;
+        (self.run_command)("ip", &["addr", "add", &format!("fe80::{:x}:{:x}/64", local_sock.ip().segments()[6], local_sock.ip().segments()[7]), "dev", &intf])?;
         println!("setting link up");
         (self.run_command)("ip", &["link", "set", &intf, "up"])?;
         println!("configuring wg");
-        let wg_proc = Command::new("wg").args(&[
+        let output = (self.run_command)("wg", &[
             "set", 
             &intf, 
+            "private-key",
+            &format!("{}", file_path.to_str().unwrap()),
             "listen-port", 
             &format!("{}", local_sock.port()), 
             "peer", 
@@ -370,12 +405,9 @@ impl KernelInterface {
             "endpoint", 
             &format!("{}:{}", destination, remote_sock.port()), 
             "allowed-ips",
-            "::/0"]).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-        wg_proc.stdin.unwrap().write_all(priv_key.as_bytes())?;
-        let mut res = String::new();
-        wg_proc.stderr.unwrap().read_to_string(&mut res);
-        if !res.is_empty() {
-            panic!("{}", res);
+            "::/0"])?;
+        if !output.stderr.is_empty() {
+            panic!("{}", String::from_utf8(output.stderr)?);
         }
         println!("done");
         Ok(())
