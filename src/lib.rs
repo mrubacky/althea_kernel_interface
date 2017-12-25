@@ -76,6 +76,23 @@ pub struct KernelInterface<T: CommandRunner> {
     command_runner: T
 }
 
+/// Assemble a Command to generate a WireGuard private key on Linux
+pub fn gen_wg_privkey_command_linux() -> Command {
+    let mut privkey_command = Command::new("wg");
+    privkey_command.arg("genkey").stdin(Stdio::null()).stdout(Stdio::piped());
+
+    privkey_command
+}
+
+/// Assemble a Command to derive a WireGuard public key from a given private key on Linux.
+/// Includes stdin.
+pub fn gen_wg_pubkey_command_linux(privkey: &String) -> (Command, String) {
+    let mut pubkey_command = Command::new("wg");
+    pubkey_command.arg("pubkey").stdin(Stdio::piped()).stdout(Stdio::piped());
+
+    (pubkey_command, String::clone(&privkey))
+}
+
 impl<T: CommandRunner> KernelInterface<T>{
     fn new(command_runner: T) -> KernelInterface<T>{
         KernelInterface {
@@ -355,7 +372,7 @@ impl<T: CommandRunner> KernelInterface<T>{
         }
         let port = (( (res[0] as u16) | (res[1] as u16) << 8) % 55535) + 10000;
         let addr = SocketAddrV6::new(Ipv6Addr::from_str(ipv6addr.as_str()).unwrap(), port, 0, 0);
-        addr        
+        addr
     }
 
     pub fn open_tunnel(&mut self, destination: IpAddr) -> Result<(),Error> {
@@ -367,7 +384,26 @@ impl<T: CommandRunner> KernelInterface<T>{
     }
 
     pub fn open_tunnel_linux(&mut self, destination: IpAddr) -> Result<(),Error> {
-        let (priv_key, my_pub_key) = self.get_keypair()?;
+        /* We ask to create a new Command to run and it's up to us whether we should really run it.
+         * The tests are supposed to take advantage of that and verify Commands without running
+         * them. Non-test callers will benefit from being able to schedule when they wanna run and
+         * to handle errors they way they want. Also, std::process::Command is a standard,
+         * well-known struct.
+         *
+         * In this case we do run it cause we're a caller that really wants the command's results.
+         */
+        let priv_key_bytes = gen_wg_privkey_command_linux().output().unwrap().stdout;
+        let priv_key = String::from_utf8(priv_key_bytes).unwrap();
+
+        let (mut pubkey_command, pubkey_stdin) = gen_wg_pubkey_command_linux(&priv_key);
+
+        let pubkey_child = pubkey_command.spawn()?;
+        pubkey_child.stdin.unwrap().write_all(pubkey_stdin.as_bytes()).unwrap();
+
+        let mut my_pub_key = String::new();
+        pubkey_child.stdout.unwrap().read_to_string(&mut my_pub_key)?;
+        my_pub_key.pop();
+
         println!("getting remote key");
         let remote_pub_key = self.get_tunnel_key(&destination, &my_pub_key)?;
         println!("finished getting key");
@@ -382,22 +418,10 @@ impl<T: CommandRunner> KernelInterface<T>{
         Ok(())
     }
 
-    pub fn get_keypair(&mut self) -> Result<(String,String),Error> {
-        let mut priv_key = String::from_utf8(self.command_runner.run_command("wg", &["genkey"])?.stdout).unwrap();
-        priv_key.pop();
-        let pub_key_proc = Command::new("wg").args(&["pubkey"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-        pub_key_proc.stdin.unwrap().write_all(priv_key.as_bytes()).unwrap();
-        let mut my_pub_key = String::new();
-        pub_key_proc.stdout.unwrap().read_to_string(&mut my_pub_key);
-        my_pub_key.pop();
-
-        Ok((priv_key,my_pub_key))
-    }
-
     pub fn setup_wg(
-        &mut self, 
-        destination: &IpAddr, 
-        local_sock: &SocketAddrV6, 
+        &mut self,
+        destination: &IpAddr,
+        local_sock: &SocketAddrV6,
         remote_sock: &SocketAddrV6,
         priv_key: &String,
         remote_pub_key: &String) -> Result<(),Error> {
@@ -423,16 +447,16 @@ impl<T: CommandRunner> KernelInterface<T>{
         self.command_runner.run_command("ip", &["link", "set", &intf, "up"])?;
         println!("configuring wg");
         let output = self.command_runner.run_command("wg", &[
-            "set", 
-            &intf, 
+            "set",
+            &intf,
             "private-key",
             &format!("{}", file_path.to_str().unwrap()),
-            "listen-port", 
-            &format!("{}", local_sock.port()), 
-            "peer", 
-            &format!("{}", remote_pub_key), 
-            "endpoint", 
-            &format!("{}:{}", destination, remote_sock.port()), 
+            "listen-port",
+            &format!("{}", local_sock.port()),
+            "peer",
+            &format!("{}", remote_pub_key),
+            "endpoint",
+            &format!("{}:{}", destination, remote_sock.port()),
             "allowed-ips",
             "::/0"])?;
         if !output.stderr.is_empty() {
@@ -446,6 +470,44 @@ impl<T: CommandRunner> KernelInterface<T>{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gen_wg_privkey_command_linux() {
+        // If we want we can verify that the generated command is sane without
+        // running it and changing machine state - exactly as we wanted
+        let comm = gen_wg_privkey_command_linux();
+        assert_eq!(format!("{:?}", comm), "\"wg\" \"genkey\"");
+    }
+
+    #[test]
+    fn test_gen_wg_pubkey_command_linux() {
+        // Here's an example where we actually run the command - unlike the tests we'll
+        // ultimately want. This is just an example
+        let privkey = String::from("4OIqHrSRSMiqNwG6Jh0oRQCCIJk3ORRb+KPz8IgXmk4=");
+        let (mut comm, comm_stdin) = gen_wg_pubkey_command_linux(&privkey);
+        assert_eq!(format!("{:?}", comm), "\"wg\" \"pubkey\"");
+        assert_eq!(comm_stdin, privkey);
+
+        // Now, let's see an example of how the generated commands can be used by the caller
+        let expected_pubkey = String::from("Rq9KRqCbgmBBcnZseI67tkjSdovl43h+9Gt7gCZXHEk=");
+
+        // We run the command
+        let mut running_comm = comm.spawn().unwrap();
+
+        // We fill its stdin as prescribed by the command generator in the second tuple member
+        running_comm.stdin.unwrap().write_all(comm_stdin.as_bytes()).unwrap();
+
+        // We retrieve the command's output
+        let mut actual_pubkey = String::new();
+        running_comm.stdout.unwrap().read_to_string(&mut actual_pubkey);
+
+        // We shave off the newline from the end
+        let _ = actual_pubkey.pop();
+
+        // Let's see if that's what we wanted
+        assert_eq!(actual_pubkey, expected_pubkey);
+    }
+
     #[test]
     fn test_get_neighbors_linux() {
         let test_output = Output {
