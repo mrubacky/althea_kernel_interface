@@ -10,12 +10,15 @@ extern crate regex;
 extern crate itertools;
 
 use itertools::join;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use hwaddr::HwAddr;
 use std::str::FromStr;
 use regex::Regex;
-use std::process::{Command, Output, ExitStatus};
+use std::process::{Command, Output, ExitStatus, Stdio};
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::fs::File;
+use std::io::Write;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -276,6 +279,130 @@ impl KernelInterface {
         Err(Error::RuntimeError(
             String::from("not implemented for this platform"),
         ))
+    }
+
+    pub fn open_tunnel(
+        &mut self, 
+        interface: &String,
+        endpoint: &SocketAddr, 
+        remote_pub_key: &String, 
+        private_key_path: &Path
+    ) -> Result<(), Error> {
+            if cfg!(target_os = "linux") {
+                return self.open_tunnel_linux(interface, endpoint, remote_pub_key, private_key_path);
+            }
+
+            Err(Error::RuntimeError(String::from("not implemented for this platform")))
+    }
+
+    fn open_tunnel_linux(
+        &mut self,
+        interface: &String,
+        endpoint: &SocketAddr,
+        remote_pub_key: &String,
+        private_key_path: &Path
+    ) -> Result<(), Error> {
+        let output = self.run_command("wg", &[
+            "set",
+            &interface,
+            "private-key",
+            &format!("{}", private_key_path.to_str().unwrap()),
+            "peer",
+            &format!("{}", remote_pub_key),
+            "endpoint",
+            &format!("{}", endpoint),
+            "allowed-ips",
+            "::/0"
+        ])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error from wg command: {}", String::from_utf8(output.stderr)?)));
+        }
+        Ok(())
+    }
+
+    pub fn delete_tunnel(&mut self, interface: &String) -> Result<(),Error> {
+            if cfg!(target_os = "linux") {
+                return self.delete_tunnel_linux(interface);
+            }
+
+            Err(Error::RuntimeError(String::from("not implemented for this platform")))
+    }
+
+    fn delete_tunnel_linux(&mut self, interface: &String) -> Result<(),Error> {
+        let output = self.run_command("ip", &["link", "del", &interface])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error deleting wireguard interface: {}", String::from_utf8(output.stderr)?)));
+        }
+        Ok(())
+    }
+
+    pub fn setup_wg_if(&mut self, addr: &IpAddr, peer: &IpAddr) -> Result<String,Error> {
+            if cfg!(target_os = "linux") {
+                return self.setup_wg_if_linux(addr, peer);
+            }
+
+            Err(Error::RuntimeError(String::from("not implemented for this platform")))
+    }
+    //checks the existing interfaces to find an interface name that isn't in use.
+    //then calls iproute2 to set up a new interface.
+    fn setup_wg_if_linux(&mut self, addr: &IpAddr, peer: &IpAddr) -> Result<String,Error> {
+        //call "ip links" to get a list of currently set up links
+        let links = String::from_utf8(self.run_command("ip", &["link"])?.stdout)?;
+        let mut if_num = 0;
+        //loop through the output of "ip links" until we find a wg suffix that isn't taken (e.g. "wg3")
+        while links.contains(format!("wg{}", if_num).as_str()) {
+            if_num += 1;
+        }
+        let interface = format!("wg{}", if_num);
+        let output = self.run_command("ip", &["link", "add", &interface, "type", "wireguard"])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error adding wg link: {}", String::from_utf8(output.stderr)?)))
+        }
+        let output = self.run_command("ip", &["addr", "add", &format!("{}", addr), "dev", &interface, "peer", &format!("{}", peer)])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error adding wg address: {}", String::from_utf8(output.stderr)?)))
+        }
+        let output = self.run_command("ip", &["link", "set", &interface, "up"])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error setting wg interface up: {}", String::from_utf8(output.stderr)?)))
+        }
+        Ok(interface)
+    }
+
+    pub fn create_wg_key(&mut self, path: &Path) -> Result<(),Error> {
+            if cfg!(target_os = "linux") {
+                return self.create_wg_key_linux(path);
+            }
+
+            Err(Error::RuntimeError(String::from("not implemented for this platform")))
+
+    }
+    fn create_wg_key_linux(&mut self, path: &Path) -> Result<(),Error> {
+        let mut output = self.run_command("wg", &["genkey"])?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error in generating wg key: {}", String::from_utf8(output.stderr)?)));
+        }
+        output.stdout.truncate(44);
+        let mut priv_key_file = File::create(path)?;
+        write!(priv_key_file, "{}", String::from_utf8(output.stdout)?)?;
+        Ok(())
+    }
+
+    pub fn get_wg_pubkey(&mut self, path: &Path) -> Result<String, Error> {
+            if cfg!(target_os = "linux") {
+                return self.get_wg_pubkey_linux(path);
+            }
+
+            Err(Error::RuntimeError(String::from("not implemented for this platform")))
+    }
+    fn get_wg_pubkey_linux(&mut self, path: &Path) -> Result<String, Error> {
+        let priv_key_file = File::open(path)?;
+        let mut output = Command::new("wg").args(&["pubkey"]).stdin(Stdio::from(priv_key_file)).output()?;
+        if !output.stderr.is_empty() {
+            return Err(Error::RuntimeError(format!("recieved error in getting wg public key: {}", String::from_utf8(output.stderr)?)));
+        }
+        output.stdout.truncate(44);
+        Ok(String::from_utf8(output.stdout)?)
     }
 }
 
